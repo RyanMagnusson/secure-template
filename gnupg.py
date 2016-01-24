@@ -32,9 +32,9 @@ Modifications Copyright (C) 2008-2014 Vinay Sajip. All rights reserved.
 A unittest harness (test_gnupg.py) has also been added.
 """
 
-__version__ = "0.3.8.dev0"
+__version__ = "0.3.8"
 __author__ = "Vinay Sajip"
-__date__  = "$07-Dec-2014 18:46:17$"
+__date__  = "$24-Sep-2015 18:03:55$"
 
 try:
     from io import StringIO
@@ -119,8 +119,18 @@ else:
 
 # Now that we use shell=False, we shouldn't need to quote arguments.
 # Use no_quote instead of shell_quote to remind us of where quoting
-# was needed.
+# was needed. However, note that we still need, on 2.x, to encode any
+# Unicode argument with the file system encoding - see Issue #41 and
+# Python issue #1759845 ("subprocess.call fails with unicode strings in
+# command line").
+
+# Allows the encoding used to be overridden in special cases by setting
+# this module attribute appropriately.
+fsencoding = sys.getfilesystemencoding()
+
 def no_quote(s):
+    if not _py3k and isinstance(s, text_type):
+        s = s.encode(fsencoding)
     return s
 
 def _copy_data(instream, outstream):
@@ -131,7 +141,13 @@ def _copy_data(instream, outstream):
     else:
         enc = 'ascii'
     while True:
-        data = instream.read(1024)
+        # See issue #39: read can fail when e.g. a text stream is provided
+        # for what is actually a binary file
+        try:
+            data = instream.read(1024)
+        except UnicodeError:
+            logger.warning('Exception occurred while reading', exc_info=1)
+            break
         if not data:
             break
         sent += len(data)
@@ -529,7 +545,8 @@ class Crypt(Verify, TextHandler):
                    "PINENTRY_LAUNCHED"):
             # in the case of ERROR, this is because a more specific error
             # message will have come first
-            pass
+            if key == "NODATA":
+                self.status = "no data was provided"
         elif key in ("NEED_PASSPHRASE", "BAD_PASSPHRASE", "GOOD_PASSPHRASE",
                      "MISSING_PASSPHRASE", "DECRYPTION_FAILED",
                      "KEY_NOT_CREATED", "NEED_PASSPHRASE_PIN"):
@@ -582,6 +599,14 @@ class GenKey(object):
         else:
             raise ValueError("Unknown status message: %r" % key)
 
+class ExportResult(GenKey):
+    """Handle status messages for --export[-secret-key].
+
+    For now, just use an existing class to base it on - if needed, we
+    can override handle_status for more specific message handling.
+    """
+    pass
+
 class DeleteResult(object):
     "Handle status messages for --delete-key and --delete-secret-key"
     def __init__(self, gpg):
@@ -627,7 +652,8 @@ class Sign(TextHandler):
         if key in ("USERID_HINT", "NEED_PASSPHRASE", "BAD_PASSPHRASE",
                    "GOOD_PASSPHRASE", "BEGIN_SIGNING", "CARDCTRL", "INV_SGNR",
                    "NO_SGNR", "MISSING_PASSPHRASE", "NEED_PASSPHRASE_PIN",
-                   "SC_OP_FAILURE", "SC_OP_SUCCESS", "PROGRESS"):
+                   "SC_OP_FAILURE", "SC_OP_SUCCESS", "PROGRESS",
+                   "PINENTRY_LAUNCHED"):
             pass
         elif key in ("KEYEXPIRED", "SIGEXPIRED"):
             self.status = 'key expired'
@@ -659,6 +685,7 @@ class GPG(object):
         'search': SearchKeys,
         'sign': Sign,
         'verify': Verify,
+        'export': ExportResult,
     }
 
     "Encapsulate access to the gpg executable"
@@ -1083,7 +1110,7 @@ class GPG(object):
         # gpg --export produces no status-fd output; stdout will be
         # empty in case of failure
         #stdout, stderr = p.communicate()
-        result = self.result_map['delete'](self) # any result will do
+        result = self.result_map['export'](self)
         self._collect_output(p, result, stdin=p.stdin)
         logger.debug('export_keys result: %r', result.data)
         return result.data.decode(self.encoding, self.decode_errors)
@@ -1109,7 +1136,7 @@ class GPG(object):
                 getattr(result, keyword)(L)
         return result
 
-    def list_keys(self, secret=False):
+    def list_keys(self, secret=False, keys=None):
         """ list the keys currently in the keyring
 
         >>> import shutil
@@ -1132,6 +1159,10 @@ class GPG(object):
         args = ['--list-%s' % which, '--fixed-list-mode',
                 '--fingerprint', '--fingerprint',   # get subkey FPs, too
                 '--with-colons']
+        if keys:
+            if isinstance(keys, string_types):
+                keys = [keys]
+            args.extend(keys)
         p = self._open_subprocess(args)
         return self._get_list_output(p, 'list')
 
